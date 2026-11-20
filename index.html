@@ -1,0 +1,1308 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>HW7 — Abandoned Bathroom</title>
+  <style>
+    body { background: #111; color: #ccc; font-family: monospace; }
+    canvas { border: 1px solid #444; touch-action: none; display: block; width: 640px; height: 400px; max-width: 100%; }
+    .layout { display: flex; gap: 10px; align-items: flex-start; }
+    .editors { display: flex; flex-direction: column; gap: 10px; }
+    textarea {
+      background: #222;
+      color: #0f0;
+      font: 14px monospace;
+      width: 400px;
+      height: 200px;
+      box-sizing: border-box;
+      white-space: pre;
+    }
+    #shaderError { color: #f66; white-space: pre-wrap; width: 400px; margin: 0; }
+    .controls { margin-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+    .control-row { display: flex; align-items: center; gap: 10px; }
+  </style>
+</head>
+
+<body>
+  <h2>HW7 — Abandoned Bathroom</h2>
+
+  <p>Drag the canvas to orbit the camera. Max Bounces sets the reflection depth, Ambient Strength adjusts the room's brightness, and Camera Distance moves the view closer or farther away. Bulb Flicker toggles the hanging light. You can edit either shader on the left.</p>
+
+  <div class="layout">
+    <div class="editors">
+      <div>
+        <b>Vertex Shader</b><br>
+        <textarea id="vertEditor" spellcheck="false"></textarea>
+      </div>
+      <div>
+        <b>Fragment Shader</b><br>
+        <textarea id="fragEditor" spellcheck="false"></textarea>
+      </div>
+      <pre id="shaderError"></pre>
+    </div>
+
+    <div>
+      <canvas id="glcanvas" width="320" height="200"></canvas>
+
+      <div class="controls">
+        <div class="control-row">
+          <label for="bounces">Max Bounces:</label>
+          <input type="range" id="bounces" min="1" max="4" value="2">
+          <span id="bouncesValue">2</span>
+        </div>
+        <div class="control-row">
+          <label for="ambient">Ambient Strength:</label>
+          <input type="range" id="ambient" min="0" max="1" step="0.05" value="0.05">
+          <span id="ambientValue">0.05</span>
+        </div>
+        <div class="control-row">
+          <label for="cameraDistance">Camera Distance:</label>
+          <input type="range" id="cameraDistance" min="7.0" max="16.0" step="0.1" value="13.0">
+          <span id="cameraDistanceValue">13.0</span>
+        </div>
+        <div class="control-row">
+          <label for="flicker">Bulb Flicker:</label>
+          <input type="checkbox" id="flicker" checked>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script id="vertex-shader" type="x-shader/x-vertex">#version 300 es
+in vec2 position;
+void main() {
+    gl_Position = vec4(position, 0.0, 1.0);
+}
+</script>
+
+<script id="fragment-shader" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+
+uniform float u_time;
+uniform vec2 u_resolution;
+uniform int u_maxBounces;
+uniform float u_ambientStrength;
+uniform vec2 u_cameraOrbit;
+uniform float u_cameraDistance;
+uniform float u_lightFlicker;
+
+out vec4 fragColor;
+
+const float LIGHT_POWER = 1.65;
+const float FLOOR_Y = -2.0;
+
+const float CHECKER_SIZE = 0.75;
+const float GLASS_IOR = 1.5;
+
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+struct Sphere {
+    vec3 center;
+    float radius;
+    vec3 color;
+};
+
+struct Box {
+    vec3 center;
+    vec3 halfSize;
+    vec3 color;
+    float reflectivity;
+};
+
+struct HitData {
+    bool hit;
+    float t;
+    vec3 point;
+    vec3 normal;
+    vec3 color;
+    float reflectivity;
+    bool isLight;
+    bool isGlass;
+};
+
+// Room geometry
+const Box backWall = Box(
+    vec3(0.0, 1.5, -12.5), vec3(7.12, 3.5, 0.12),
+    vec3(0.43, 0.48, 0.45), 0.0);
+const Box frontWall = Box(
+    vec3(0.0, 1.5, 0.5), vec3(7.12, 3.5, 0.12),
+    vec3(0.43, 0.48, 0.45), 0.0);
+const Box westWallNorth = Box(
+    vec3(-7.0, 1.5, -11.275), vec3(0.12, 3.5, 1.225),
+    vec3(0.36, 0.41, 0.39), 0.0);
+const Box westWallSouth = Box(
+    vec3(-7.0, 1.5, -3.325), vec3(0.12, 3.5, 3.825),
+    vec3(0.36, 0.41, 0.39), 0.0);
+const Box westWallHeader = Box(
+    vec3(-7.0, 4.15, -8.60), vec3(0.12, 0.85, 1.45),
+    vec3(0.36, 0.41, 0.39), 0.0);
+const Box ceiling = Box(
+    vec3(0.0, 5.0, -6.0), vec3(7.12, 0.12, 6.62),
+    vec3(0.30, 0.34, 0.33), 0.0);
+
+const Box lightCord = Box(
+    vec3(0.0, 4.54, -6.0), vec3(0.025, 0.34, 0.025),
+    vec3(0.18, 0.18, 0.18), 0.0);
+const Sphere lightBulb = Sphere(vec3(0.0, 3.95, -6.0), 0.18, vec3(1.0, 0.95, 0.82));
+
+// Rotated door and handle
+const vec3 DOOR_CENTER = vec3(-6.8276, 0.65, -8.60);
+const vec3 DOOR_HALF = vec3(0.055, 2.65, 1.44);
+const float DOOR_YAW = 0.12;
+const vec3 DOOR_COLOR = vec3(0.33, 0.23, 0.15);
+const vec3 DOOR_HANDLE_COLOR = vec3(0.64, 0.63, 0.60);
+
+const vec3 DOOR_HANDLE_CENTER = vec3(-6.595, 0.65, -7.49);
+const vec3 DOOR_HANDLE_HALF = vec3(0.045, 0.10, 0.045);
+
+// Sink, vanity and mirror
+const vec3 STONE_COLOR = vec3(0.80, 0.79, 0.74);
+const vec3 BASIN_COLOR = vec3(0.93, 0.95, 0.91);
+const vec3 WOOD_COLOR = vec3(0.25, 0.15, 0.095);
+const vec3 WOOD_DOOR_COLOR = vec3(0.31, 0.20, 0.13);
+const vec3 METAL_COLOR = vec3(0.66, 0.67, 0.65);
+
+const vec3 COUNTER_CENTER = vec3(-1.8, 0.15, -11.10);
+const vec3 COUNTER_HALF = vec3(2.55, 0.13, 1.14);
+const vec2 BASIN_CENTER_XZ = vec2(-1.8, -10.88);
+const vec2 BASIN_RADII = vec2(1.12, 0.68);
+
+const float SINK_WATER_Y = -0.09;
+const vec2 SINK_WATER_RADII = vec2(0.963, 0.580);
+const vec3 SINK_WATER_COLOR = vec3(0.20, 0.23, 0.10);
+
+const Box vanityLeft = Box(vec3(-4.20, -0.98, -11.10),
+    vec3(0.10, 1.00, 1.02), WOOD_COLOR, 0.0);
+const Box vanityRight = Box(vec3(0.60, -0.98, -11.10),
+    vec3(0.10, 1.00, 1.02), WOOD_COLOR, 0.0);
+const Box vanityBack = Box(vec3(-1.80, -0.98, -12.09),
+    vec3(2.34, 1.00, 0.08), WOOD_COLOR, 0.0);
+const Box vanityBottom = Box(vec3(-1.80, -1.83, -11.10),
+    vec3(2.35, 0.08, 1.03), WOOD_COLOR, 0.0);
+const Box leftDoor = Box(vec3(-2.97, -0.94, -10.03),
+    vec3(1.13, 0.94, 0.07), WOOD_DOOR_COLOR, 0.0);
+const Box rightDoor = Box(vec3(-0.63, -0.94, -10.03),
+    vec3(1.13, 0.94, 0.07), WOOD_DOOR_COLOR, 0.0);
+const Box kickboard = Box(vec3(-1.80, -1.92, -10.27),
+    vec3(2.24, 0.075, 0.09), vec3(0.14, 0.095, 0.065), 0.0);
+
+const Box leftHandle = Box(vec3(-1.96, -0.93, -9.935),
+    vec3(0.045, 0.26, 0.055), METAL_COLOR, 0.0);
+const Box rightHandle = Box(vec3(-1.64, -0.93, -9.935),
+    vec3(0.045, 0.26, 0.055), METAL_COLOR, 0.0);
+
+const Box faucetBase = Box(vec3(-1.8, 0.35, -11.70),
+    vec3(0.19, 0.075, 0.19), METAL_COLOR, 0.0);
+const Box faucetStem = Box(vec3(-1.8, 0.57, -11.70),
+    vec3(0.065, 0.19, 0.065), METAL_COLOR, 0.0);
+const Box faucetSpout = Box(vec3(-1.8, 0.76, -11.49),
+    vec3(0.065, 0.065, 0.29), METAL_COLOR, 0.0);
+const Box faucetTip = Box(vec3(-1.8, 0.66, -11.25),
+    vec3(0.070, 0.085, 0.075), METAL_COLOR, 0.0);
+
+const Box mirror = Box(vec3(-1.80, 2.52, -12.03),
+    vec3(1.92, 1.15, 0.035), vec3(0.85, 0.90, 0.93), 0.94);
+const vec3 FRAME_COLOR = vec3(0.13, 0.15, 0.15);
+const Box mirrorTop = Box(vec3(-1.80, 3.71, -12.00),
+    vec3(2.055, 0.10, 0.09), FRAME_COLOR, 0.0);
+const Box mirrorBottom = Box(vec3(-1.80, 1.33, -12.00),
+    vec3(2.055, 0.10, 0.09), FRAME_COLOR, 0.0);
+const Box mirrorLeft = Box(vec3(-3.805, 2.52, -12.00),
+    vec3(0.10, 1.09, 0.09), FRAME_COLOR, 0.0);
+const Box mirrorRight = Box(vec3(0.205, 2.52, -12.00),
+    vec3(0.10, 1.09, 0.09), FRAME_COLOR, 0.0);
+
+// Toilet
+const vec3 TOILET_CERAMIC = vec3(0.83, 0.86, 0.80);
+const vec3 TOILET_SEAT_COLOR = vec3(0.95, 0.95, 0.89);
+const vec3 TOILET_INSIDE_COLOR = vec3(0.57, 0.63, 0.60);
+
+const Box toiletTank = Box(
+    vec3(-1.50, 0.00, -0.04), vec3(0.86, 0.70, 0.37),
+    TOILET_CERAMIC, 0.0);
+const Box toiletTankLid = Box(
+    vec3(-1.50, 0.73, -0.04), vec3(0.93, 0.065, 0.41),
+    TOILET_SEAT_COLOR, 0.0);
+const Box toiletFlushButton = Box(
+    vec3(-1.50, 0.802, -0.04), vec3(0.19, 0.012, 0.12),
+    METAL_COLOR, 0.0);
+
+const Box toiletPedestal = Box(
+    vec3(-1.50, -1.69, -0.87), vec3(0.49, 0.30, 0.43),
+    TOILET_CERAMIC, 0.0);
+
+const vec3 TOILET_BODY_CENTER = vec3(-1.50, -1.46, -1.27);
+const vec3 TOILET_BODY_RADII = vec3(0.89, 0.55, 1.12);
+
+const vec2 TOILET_SEAT_XZ = vec2(-1.50, -1.27);
+const vec2 TOILET_SEAT_OUTER = vec2(0.99, 1.20);
+const vec2 TOILET_SEAT_INNER = vec2(0.62, 0.80);
+const float TOILET_SEAT_TOP = -0.72;
+const float TOILET_SEAT_BOTTOM = -0.87;
+
+bool intersectSphere(Ray ray, Sphere s, out float t) {
+    vec3 oc = ray.origin - s.center;
+    float b = dot(oc, ray.direction);
+    float d = b * b - dot(oc, oc) + s.radius * s.radius;
+    if (d < 0.0) return false;
+
+    t = -b - sqrt(d);
+    if (t < 0.001) t = -b + sqrt(d);
+    return t > 0.001;
+}
+
+// Ray intersections
+bool intersectBox(Ray ray, Box box, out float t, out vec3 normal) {
+    vec3 low = box.center - box.halfSize;
+    vec3 high = box.center + box.halfSize;
+    const float EPS = 0.00001;
+
+    if (abs(ray.direction.x) < EPS && (ray.origin.x < low.x || ray.origin.x > high.x)) return false;
+    if (abs(ray.direction.y) < EPS && (ray.origin.y < low.y || ray.origin.y > high.y)) return false;
+    if (abs(ray.direction.z) < EPS && (ray.origin.z < low.z || ray.origin.z > high.z)) return false;
+
+    vec3 safeDir = vec3(
+        abs(ray.direction.x) < EPS ? EPS : ray.direction.x,
+        abs(ray.direction.y) < EPS ? EPS : ray.direction.y,
+        abs(ray.direction.z) < EPS ? EPS : ray.direction.z
+    );
+    vec3 t0 = (low - ray.origin) / safeDir;
+    vec3 t1 = (high - ray.origin) / safeDir;
+    vec3 nearT = min(t0, t1);
+    vec3 farT = max(t0, t1);
+    float entry = max(max(nearT.x, nearT.y), nearT.z);
+    float exit = min(min(farT.x, farT.y), farT.z);
+    if (exit <= 0.001 || entry > exit) return false;
+
+    t = entry > 0.001 ? entry : exit;
+    vec3 surface = (ray.origin + ray.direction * t - box.center) / box.halfSize;
+    vec3 a = abs(surface);
+    if (a.x > a.y && a.x > a.z) normal = vec3(sign(surface.x), 0.0, 0.0);
+    else if (a.y > a.z) normal = vec3(0.0, sign(surface.y), 0.0);
+    else normal = vec3(0.0, 0.0, sign(surface.z));
+    return true;
+}
+
+vec3 rotateYVec(vec3 p, float a) {
+    float c = cos(a), s = sin(a);
+    return vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z);
+}
+
+bool intersectRotatedYBox(Ray ray, vec3 center, vec3 halfSize, float angle, out float t, out vec3 normal) {
+    Ray localRay;
+    localRay.origin = rotateYVec(ray.origin - center, -angle);
+    localRay.direction = rotateYVec(ray.direction, -angle);
+    Box localBox = Box(vec3(0.0), halfSize, vec3(0.0), 0.0);
+    vec3 localNormal;
+    if (!intersectBox(localRay, localBox, t, localNormal)) return false;
+    normal = rotateYVec(localNormal, angle);
+    return true;
+}
+
+bool intersectToiletBody(Ray ray, out float t, out vec3 normal) {
+    vec3 o = (ray.origin - TOILET_BODY_CENTER) / TOILET_BODY_RADII;
+    vec3 d = ray.direction / TOILET_BODY_RADII;
+    float a = dot(d, d), b = dot(o, d), c = dot(o, o) - 1.0;
+    float disc = b*b - a*c;
+    if (disc < 0.0) return false;
+    float root = sqrt(disc);
+    t = 1e10;
+    for (int i = 0; i < 2; i++) {
+        float candidate = (-b + (i == 0 ? -root : root)) / a;
+        if (candidate <= 0.001) continue;
+        vec3 p = ray.origin + ray.direction * candidate;
+        vec2 inside = (p.xz - TOILET_SEAT_XZ) / TOILET_SEAT_INNER;
+
+        if (dot(inside, inside) < 1.0 && p.y > -1.65) continue;
+        t = candidate;
+        normal = normalize((p - TOILET_BODY_CENTER)
+                           / (TOILET_BODY_RADII * TOILET_BODY_RADII));
+        return true;
+    }
+    return false;
+}
+
+bool intersectToiletSeat(Ray ray, out float t, out vec3 normal) {
+    float best = 1e10;
+    vec3 bestNormal = vec3(0.0);
+
+    if (abs(ray.direction.y) > 0.00001) {
+        for (int side = 0; side < 2; side++) {
+            float y = side == 0 ? TOILET_SEAT_TOP : TOILET_SEAT_BOTTOM;
+            float candidate = (y - ray.origin.y) / ray.direction.y;
+            if (candidate <= 0.001 || candidate >= best) continue;
+            vec2 q = ray.origin.xz + ray.direction.xz * candidate - TOILET_SEAT_XZ;
+            vec2 outer = q / TOILET_SEAT_OUTER;
+            vec2 inner = q / TOILET_SEAT_INNER;
+            if (dot(outer, outer) <= 1.0 && dot(inner, inner) >= 1.0) {
+                best = candidate;
+                bestNormal = side == 0 ? vec3(0.0, 1.0, 0.0) : vec3(0.0, -1.0, 0.0);
+            }
+        }
+    }
+
+    for (int which = 0; which < 2; which++) {
+        vec2 radii = which == 0 ? TOILET_SEAT_OUTER : TOILET_SEAT_INNER;
+        vec2 o = (ray.origin.xz - TOILET_SEAT_XZ) / radii;
+        vec2 d = ray.direction.xz / radii;
+        float a = dot(d, d);
+        if (a < 0.0000001) continue;
+        float b = dot(o, d);
+        float disc = b * b - a * (dot(o, o) - 1.0);
+        if (disc < 0.0) continue;
+        float root = sqrt(disc);
+        for (int k = 0; k < 2; k++) {
+            float candidate = (-b + (k == 0 ? -root : root)) / a;
+            if (candidate <= 0.001 || candidate >= best) continue;
+            vec3 p = ray.origin + candidate * ray.direction;
+            if (p.y < TOILET_SEAT_BOTTOM || p.y > TOILET_SEAT_TOP) continue;
+            vec2 radial = (p.xz - TOILET_SEAT_XZ) / (radii * radii);
+            best = candidate;
+            bestNormal = normalize(vec3(radial.x, 0.0, radial.y))
+                       * (which == 0 ? 1.0 : -1.0);
+        }
+    }
+    if (best >= 1e9) return false;
+    t = best;
+    normal = bestNormal;
+    return true;
+}
+
+bool intersectToiletInterior(Ray ray, out float t, out vec3 normal) {
+    const vec3 center = vec3(-1.50, -0.88, -1.27);
+    const vec3 radii = vec3(0.62, 0.62, 0.80);
+    vec3 o = (ray.origin - center) / radii;
+    vec3 d = ray.direction / radii;
+    float a = dot(d,d), b = dot(o,d), c = dot(o,o) - 1.0;
+    float disc = b*b - a*c;
+    if (disc < 0.0) return false;
+    float root = sqrt(disc);
+    t = 1e10;
+    for (int i = 0; i < 2; i++) {
+        float candidate = (-b + (i == 0 ? -root : root)) / a;
+        if (candidate <= 0.001 || candidate >= t) continue;
+        vec3 p = ray.origin + candidate * ray.direction;
+        if (p.y > center.y) continue;
+        t = candidate;
+        normal = -normalize((p - center) / (radii * radii));
+    }
+    return t < 1e9;
+}
+
+float ovalRadiusSquared(vec2 xz) {
+    vec2 q = (xz - BASIN_CENTER_XZ) / BASIN_RADII;
+    return dot(q, q);
+}
+
+bool intersectCountertop(Ray ray, out float t, out vec3 normal) {
+    vec3 low = COUNTER_CENTER - COUNTER_HALF;
+    vec3 high = COUNTER_CENTER + COUNTER_HALF;
+    float best = 1e10;
+    vec3 bestNormal = vec3(0.0);
+
+    for (int axis = 0; axis < 3; axis++) {
+        float d = ray.direction[axis];
+        if (abs(d) < 0.00001) continue;
+        for (int side = 0; side < 2; side++) {
+            float plane = side == 0 ? low[axis] : high[axis];
+            float candidate = (plane - ray.origin[axis]) / d;
+            if (candidate <= 0.001 || candidate >= best) continue;
+            vec3 p = ray.origin + candidate * ray.direction;
+            if (any(lessThan(p, low - vec3(0.0001))) ||
+                any(greaterThan(p, high + vec3(0.0001)))) continue;
+
+            if (ovalRadiusSquared(p.xz) < 1.0) continue;
+            best = candidate;
+            bestNormal = vec3(0.0);
+            bestNormal[axis] = side == 0 ? -1.0 : 1.0;
+        }
+    }
+
+    vec2 o = (ray.origin.xz - BASIN_CENTER_XZ) / BASIN_RADII;
+    vec2 d = ray.direction.xz / BASIN_RADII;
+    float a = dot(d, d);
+    float b = 2.0 * dot(o, d);
+    float c = dot(o, o) - 1.0;
+    if (a > 0.0000001) {
+        float discriminant = b*b - 4.0*a*c;
+        if (discriminant >= 0.0) {
+            float root = sqrt(discriminant);
+            for (int k = 0; k < 2; k++) {
+                float candidate = (-b + (k == 0 ? -root : root)) / (2.0*a);
+                if (candidate <= 0.001 || candidate >= best) continue;
+                vec3 p = ray.origin + candidate * ray.direction;
+                if (p.y < low.y - 0.0001 || p.y > high.y + 0.0001) continue;
+                best = candidate;
+
+                bestNormal = normalize(vec3(
+                    -(p.x - BASIN_CENTER_XZ.x) / (BASIN_RADII.x*BASIN_RADII.x),
+                    0.0,
+                    -(p.z - BASIN_CENTER_XZ.y) / (BASIN_RADII.y*BASIN_RADII.y)));
+            }
+        }
+    }
+    if (best >= 1e9) return false;
+    t = best;
+    normal = bestNormal;
+    return true;
+}
+
+bool intersectSinkBowl(Ray ray, out float t, out vec3 normal) {
+    const vec3 center = vec3(-1.8, 0.28, -10.88);
+    const vec3 radii = vec3(1.12, 0.78, 0.68);
+    vec3 o = (ray.origin - center) / radii;
+    vec3 d = ray.direction / radii;
+    float a = dot(d, d);
+    float b = 2.0 * dot(o, d);
+    float c = dot(o, o) - 1.0;
+    float disc = b*b - 4.0*a*c;
+    if (disc < 0.0) return false;
+    float root = sqrt(disc);
+    t = 1e10;
+    for (int k = 0; k < 2; k++) {
+        float candidate = (-b + (k == 0 ? -root : root)) / (2.0*a);
+        if (candidate <= 0.001 || candidate >= t) continue;
+        vec3 p = ray.origin + ray.direction * candidate;
+
+        if (p.y > center.y + 0.0001) continue;
+        t = candidate;
+        normal = -normalize((p - center) / (radii * radii));
+    }
+    return t < 1e9;
+}
+
+bool intersectSinkWater(Ray ray, out float t) {
+    if (abs(ray.direction.y) < 0.00001) return false;
+    t = (SINK_WATER_Y - ray.origin.y) / ray.direction.y;
+    if (t <= 0.001) return false;
+    vec2 q = (ray.origin.xz + t * ray.direction.xz - BASIN_CENTER_XZ)
+             / SINK_WATER_RADII;
+    return dot(q, q) <= 1.0;
+}
+
+// Noise used by the procedural materials
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float noise2(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float a = hash12(i);
+    float b = hash12(i + vec2(1.0, 0.0));
+    float c = hash12(i + vec2(0.0, 1.0));
+    float d = hash12(i + vec2(1.0, 1.0));
+
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float fbm(vec2 p) {
+    float value = 0.0;
+    float amplitude = 0.5;
+    for (int i = 0; i < 4; i++) {
+        value += amplitude * noise2(p);
+        p = p * 2.02 + vec2(11.8, 7.3);
+        amplitude *= 0.5;
+    }
+    return value;
+}
+
+// Surface colors use the ray's hit position
+vec3 getPorcelainColor(vec3 p, vec3 base, int kind) {
+    vec2 uv = vec2(p.x + 0.22 * p.y, p.z + 0.39 * p.y);
+    vec2 shift = kind == 0 ? vec2(4.3, 11.7) : vec2(-8.1, 3.5);
+    float cloudy = fbm(uv * 1.65 + shift);
+    float mottled = noise2(uv * 5.8 - shift);
+    float flecks = noise2(uv * 12.0 + shift * 1.5);
+
+    float oldFilm = smoothstep(0.32, 0.66,
+        cloudy * 0.77 + mottled * 0.23);
+    vec3 yellow = kind == 3 ? vec3(0.31, 0.32, 0.19)
+                            : vec3(0.55, 0.46, 0.28);
+    vec3 color = mix(base * 0.92, yellow,
+                     oldFilm * (kind == 3 ? 0.65 : 0.48));
+
+    if (kind == 0) {
+        float waterline = 1.0 - smoothstep(0.015, 0.18,
+                                          abs(p.y - SINK_WATER_Y));
+        float ringBreakup = 0.65 + 0.35 * noise2(uv * 8.0 + shift);
+        color = mix(color, vec3(0.32, 0.33, 0.16),
+                    waterline * ringBreakup * 0.70);
+
+        float upperLip = 1.0 - smoothstep(0.04, 0.36, abs(p.y - 0.28));
+        color = mix(color, vec3(0.40, 0.31, 0.18),
+                    upperLip * oldFilm * 0.32);
+    } else if (kind == 2) {
+        float seatRim = 1.0 - smoothstep(0.0, 0.24, abs(p.y + 0.72));
+        color = mix(color, vec3(0.48, 0.40, 0.24),
+                    seatRim * oldFilm * 0.38);
+    } else if (kind == 3) {
+
+        color = mix(color, vec3(0.28, 0.30, 0.16),
+                    0.18 + 0.38 * oldFilm);
+    }
+
+    float edgeWear = kind == 0
+        ? 1.0 - smoothstep(0.06, 0.38, abs(p.y - 0.28))
+        : (kind == 2 ? 0.85 : 0.30);
+    float chipShape = noise2(uv * 7.4 + vec2(19.1, -3.8));
+    float chips = smoothstep(0.70, 0.81, chipShape)
+                 * (0.28 + 0.72 * edgeWear);
+    color = mix(color, vec3(0.25, 0.24, 0.18), chips * 0.70);
+
+    float chipEdge = smoothstep(0.62, 0.71, chipShape)
+                   * (1.0 - smoothstep(0.73, 0.80, chipShape));
+    color = mix(color, vec3(0.76, 0.72, 0.62),
+                chipEdge * edgeWear * 0.25);
+
+    float speckle = smoothstep(0.74, 0.86, flecks) * oldFilm;
+    color = mix(color, vec3(0.25, 0.22, 0.15), speckle * 0.46);
+    return clamp(color, 0.02, 1.0);
+}
+
+vec3 getSinkWaterColor(vec3 p) {
+    vec2 uv = p.xz - BASIN_CENTER_XZ;
+    vec2 q = uv / SINK_WATER_RADII;
+    float r = length(q);
+    float broad = fbm(p.xz * 3.5 + vec2(13.6, -7.2));
+    float fine = noise2(p.xz * 13.0 + vec2(2.3, 8.4));
+
+    vec3 murky = mix(vec3(0.24, 0.255, 0.118),
+                     vec3(0.115, 0.14, 0.065),
+                     smoothstep(0.33, 0.72, broad));
+    murky *= 0.90 + 0.13 * fine;
+
+    float shoreline = smoothstep(0.72, 0.92, r);
+    float scumNoise = noise2(p.xz * 16.0 + vec2(-3.1, 7.8));
+    vec3 scum = mix(vec3(0.34, 0.34, 0.15), vec3(0.22, 0.20, 0.09), scumNoise);
+    return clamp(mix(murky, scum, shoreline * (0.38 + 0.24 * scumNoise)), 0.0, 1.0);
+}
+
+vec3 getAgedWoodColor(vec3 p, vec3 base, int kind) {
+    vec2 uv = kind == 2
+        ? vec2(p.z * 1.35 + p.y * 0.12, p.y)
+        : vec2(p.x * 1.85 + p.z * 0.22, p.y);
+
+    float grain = fbm(vec2(uv.x * 4.8, uv.y * 0.75) + vec2(1.7, -3.5));
+    float streak = noise2(vec2(uv.x * 9.2, uv.y * 1.4) + vec2(-2.0, 5.0));
+    float blotch = fbm(uv * 1.35 + vec2(7.8, -4.1));
+    float speck = noise2(uv * 14.0 + vec2(11.2, -7.3));
+
+    vec3 color = base * (0.72 + 0.36 * grain);
+
+    float waterDamage = smoothstep(0.42, 0.73, blotch * 0.72 + streak * 0.28);
+    vec3 dampBrown = kind == 2 ? vec3(0.19, 0.13, 0.09) : vec3(0.16, 0.11, 0.075);
+    color = mix(color, dampBrown, waterDamage * 0.42);
+
+    float bottomRot = 1.0 - smoothstep(FLOOR_Y + 0.20, FLOOR_Y + 1.45, p.y);
+    float rotNoise = smoothstep(0.50, 0.82, blotch * 0.58 + grain * 0.25 + speck * 0.17);
+    float rotAmount = bottomRot * rotNoise * (kind == 2 ? 0.82 : (kind == 3 ? 0.88 : 0.58));
+    vec3 rotColor = mix(vec3(0.14, 0.12, 0.08), vec3(0.16, 0.18, 0.12), streak);
+    color = mix(color, rotColor, rotAmount);
+
+    float mold = smoothstep(0.77, 0.90, fbm(uv * 2.2 + vec2(-9.0, 4.0)));
+    color = mix(color, vec3(0.16, 0.20, 0.13),
+                mold * (0.18 + 0.32 * bottomRot));
+
+    float wear = smoothstep(0.72, 0.84, speck) * (0.35 + 0.65 * waterDamage);
+    color = mix(color, vec3(0.42, 0.34, 0.23), wear * 0.18);
+
+    if (kind == 2 || kind == 3) {
+        color *= 0.92;
+    }
+    return clamp(color, 0.02, 1.0);
+}
+
+vec3 getCeilingColor(vec3 p) {
+    vec2 uv = p.xz;
+    float broad = fbm(uv * 0.42 + vec2(3.1, -2.2));
+    float fine = noise2(uv * 3.8 + vec2(-8.0, 4.5));
+    vec3 base = vec3(0.30, 0.34, 0.33) * (0.90 + 0.12 * broad);
+
+    vec3 color = mix(base, vec3(0.25, 0.27, 0.24), smoothstep(0.40, 0.78, broad) * 0.26);
+
+    float spotField = fbm(uv * 1.55 + vec2(9.2, -6.6));
+    float spotDetail = noise2(uv * 8.0 + vec2(1.1, 12.4));
+    float stains = smoothstep(0.67, 0.82, spotField + 0.18 * spotDetail);
+    color = mix(color, vec3(0.37, 0.33, 0.24), stains * 0.34);
+
+    float bulbAura = 1.0 - smoothstep(0.25, 1.30, length(p.xz - lightBulb.center.xz));
+    float ring = smoothstep(0.28, 0.62, bulbAura) * (1.0 - smoothstep(0.62, 0.94, bulbAura));
+    color = mix(color, vec3(0.23, 0.24, 0.22), ring * 0.18);
+    return clamp(color, 0.03, 1.0);
+}
+
+float getMirrorGrime(vec3 p) {
+    vec2 uv = vec2(p.x, p.y);
+
+    uv = (uv - vec2(-1.80, 2.52)) / vec2(1.92, 1.15);
+    float edges = max(abs(uv.x), abs(uv.y));
+    float edgeBand = smoothstep(0.56, 0.96, edges);
+    float broad = fbm(uv * 3.1 + vec2(6.2, -2.9));
+    float drips = noise2(vec2(uv.x * 5.0, uv.y * 1.6) + vec2(4.0, -8.0));
+    float specks = noise2(uv * 20.0 + vec2(-9.0, 3.5));
+
+    float grime = edgeBand * (0.28 + 0.48 * broad);
+    grime += smoothstep(0.76, 0.90, drips) * (0.10 + 0.22 * edgeBand);
+    grime += smoothstep(0.86, 0.95, specks) * 0.10;
+    return clamp(grime, 0.0, 0.85);
+}
+
+vec3 getMirrorColor(vec3 p, float grime) {
+    vec2 uv = vec2(p.x, p.y);
+    uv = (uv - vec2(-1.80, 2.52)) / vec2(1.92, 1.15);
+    float haze = fbm(uv * 4.2 + vec2(11.0, -4.0));
+    vec3 clean = vec3(0.85, 0.90, 0.93);
+    vec3 dirty = mix(vec3(0.38, 0.39, 0.36), vec3(0.30, 0.31, 0.27), haze);
+    return mix(clean, dirty, grime);
+}
+
+vec3 getWallColor(vec3 p, int wallId) {
+
+    vec2 uv = wallId == 2 ? vec2(p.z, p.y) : vec2(p.x, p.y);
+    uv += wallId == 0 ? vec2(2.7, 4.1) :
+          (wallId == 1 ? vec2(-11.3, 6.6) : vec2(8.2, -3.4));
+
+    vec3 base = wallId == 2 ? vec3(0.43, 0.47, 0.42) :
+                              vec3(0.50, 0.52, 0.46);
+    float coarse = fbm(uv * 0.48);
+    float blotch = noise2(uv * 1.45 + vec2(4.8, 2.1));
+    float fine   = noise2(uv * 5.2);
+    vec3 color = base * (0.88 + 0.21 * coarse);
+
+    float heightAboveFloor = max(p.y - FLOOR_Y, 0.0);
+    float lowerWetness = (1.0 - smoothstep(0.10, 2.65, heightAboveFloor));
+
+    float distanceToCorner = wallId == 2
+        ? min(abs(p.z + 12.5), abs(p.z - 0.5))
+        : min(abs(p.x + 7.0), abs(p.x - 7.0));
+    float cornerDamp = 1.0 - smoothstep(0.0, 1.75, distanceToCorner);
+
+    float humidity = max(lowerWetness * (0.55 + 0.75 * coarse),
+                         cornerDamp * (0.36 + 0.64 * blotch));
+
+    float wetPatches = smoothstep(0.37, 0.70,
+        coarse * 0.63 + blotch * 0.37 + humidity * 0.25);
+    float dampMask = clamp(wetPatches * 0.60 + humidity * 0.36, 0.0, 0.89);
+    color = mix(color, vec3(0.28, 0.30, 0.24), dampMask);
+
+    float sporeNoise = fbm(uv * 0.92 + vec2(13.4, -9.2));
+    float moldPatch = smoothstep(0.43, 0.69,
+        sporeNoise * 0.78 + blotch * 0.22 + humidity * 0.35);
+    float moldMask = moldPatch * (0.16 + humidity * 0.78);
+    vec3 moldColor = mix(vec3(0.18, 0.22, 0.14),
+                         vec3(0.105, 0.12, 0.075), fine);
+    color = mix(color, moldColor, clamp(moldMask * 0.92, 0.0, 0.88));
+
+    float streakPattern = noise2(vec2(uv.x * 3.1, uv.y * 0.23) + vec2(2.4, 8.5));
+    float streaks = smoothstep(0.60, 0.79, streakPattern);
+    float upperLeaks = smoothstep(0.85, 4.15, p.y);
+    float streakStrength = streaks * (0.20 + 0.46 * upperLeaks);
+    color = mix(color, vec3(0.30, 0.25, 0.18), streakStrength * 0.57);
+
+    float peeled = smoothstep(0.64, 0.77,
+        coarse * 0.57 + fine * 0.43);
+    color = mix(color, vec3(0.61, 0.59, 0.49), peeled * 0.32);
+
+    color *= (0.95 + 0.10 * fine);
+    return clamp(color, 0.0, 1.0);
+}
+
+float wetPuddleMask(vec2 p) {
+    vec2 q = (p - vec2(2.3, -7.8)) / vec2(1.95, 1.40);
+    float edgeNoise = (noise2(p * 2.15 + vec2(3.7, 9.4)) - 0.5) * 0.23;
+    edgeNoise += (noise2(p * 5.2 - vec2(4.2, 1.0)) - 0.5) * 0.09;
+    return 1.0 - smoothstep(0.78, 1.03, length(q) + edgeNoise);
+}
+
+float grimeSpillMask(vec2 p) {
+    vec2 q = (p - vec2(0.8, -3.35)) / vec2(1.60, 1.17);
+    float wobble = (noise2(p * 2.4 + vec2(8.1, -2.5)) - 0.5) * 0.34;
+    wobble += (noise2(p * 5.8 + vec2(-2.0, 5.3)) - 0.5) * 0.11;
+    float mainPatch = 1.0 - smoothstep(0.69, 1.07, length(q) + wobble);
+
+    vec2 tail = (p - vec2(1.95, -2.23)) / vec2(0.70, 0.48);
+    float tailPatch = 1.0 - smoothstep(0.65, 1.09, length(tail) + wobble * 0.6);
+    return max(mainPatch, tailPatch * 0.76);
+}
+
+vec3 getFloorColor(vec3 p, out float wetness) {
+    vec2 uv = p.xz / CHECKER_SIZE;
+    vec2 cell = floor(uv);
+    vec2 f = fract(uv);
+
+    float checker = mod(cell.x + cell.y, 2.0);
+    vec3 lightTile = vec3(0.82, 0.81, 0.76);
+    vec3 darkTile  = vec3(0.095, 0.095, 0.105);
+    float tileJitter = 0.91 + 0.15 * hash12(cell + vec2(17.0, 9.0));
+    vec3 tileColor = (checker < 1.0 ? lightTile : darkTile) * tileJitter;
+
+    float edge = min(min(f.x, 1.0 - f.x), min(f.y, 1.0 - f.y));
+    float grout = 1.0 - smoothstep(0.028, 0.085, edge);
+    vec3 groutColor = vec3(0.16, 0.15, 0.13);
+    vec3 color = mix(tileColor, groutColor, grout * 0.98);
+
+    float broadDirt = fbm(p.xz * 0.35 + vec2(4.0, -3.0));
+    float patchNoise = noise2(p.xz * 1.9 + vec2(-7.0, 2.0));
+    float fineNoise = noise2(p.xz * 7.0);
+    float streakNoise = fbm(p.xz * vec2(0.9, 2.4) + vec2(3.0, -8.0));
+
+    float northDist = abs(p.z + 12.5);
+    float southDist = abs(p.z - 0.5);
+    float westDist = abs(p.x + 7.0);
+    float edgeAccum = max(
+        1.0 - smoothstep(0.0, 1.8, min(northDist, southDist)),
+        1.0 - smoothstep(0.0, 1.45, westDist)
+    );
+
+    vec2 toiletQ = (p.xz - vec2(-1.50, -1.20)) / vec2(1.45, 1.75);
+    float toiletZone = 1.0 - smoothstep(0.60, 1.35, length(toiletQ));
+    toiletZone *= 0.50 + 0.50 * broadDirt;
+
+    float dirtyMask = 0.34 * broadDirt
+                    + 0.23 * patchNoise
+                    + 0.45 * edgeAccum
+                    + 0.50 * toiletZone
+                    + 0.12 * streakNoise;
+    dirtyMask = smoothstep(0.26, 0.74, dirtyMask);
+
+    vec3 grimeColor = mix(vec3(0.22, 0.19, 0.15), vec3(0.12, 0.09, 0.055), fineNoise);
+    color = mix(color, grimeColor, dirtyMask * 0.90);
+
+    color = mix(color, color * 0.52, grout * (0.30 + 0.42 * broadDirt));
+
+    float damp = smoothstep(0.56, 0.80, fbm(p.xz * 0.58 + vec2(-2.0, 5.0)));
+    color *= 1.0 - 0.24 * damp;
+
+    float grimeSpill = grimeSpillMask(p.xz);
+    if (grimeSpill > 0.001) {
+        float granular = noise2(p.xz * 7.3 + vec2(1.8, -6.6));
+        float blotches = noise2(p.xz * 2.7 - vec2(2.4, 1.1));
+        vec3 sludge = mix(vec3(0.11, 0.077, 0.043),
+                          vec3(0.28, 0.18, 0.092),
+                          0.45 * granular + 0.55 * blotches);
+
+        color = mix(color, sludge, clamp(grimeSpill * (0.78 + 0.16 * granular), 0.0, 0.96));
+    }
+
+    float wet = wetPuddleMask(p.xz);
+    wetness = smoothstep(0.25, 0.80, wet);
+    if (wet > 0.001) {
+        float mottling = noise2(p.xz * 4.2 + vec2(4.7, 0.3));
+        vec3 waterColor = mix(vec3(0.095, 0.125, 0.112),
+                              vec3(0.16, 0.19, 0.16), mottling);
+        color = mix(color, waterColor, 0.74 * wet);
+
+        float shoreline = smoothstep(0.035, 0.22, wet) * (1.0 - smoothstep(0.35, 0.62, wet));
+        color = mix(color, vec3(0.17, 0.13, 0.074), shoreline * 0.28);
+    }
+
+    return clamp(color, 0.0, 1.0);
+}
+
+bool intersectFloor(Ray ray, out float t) {
+    if (abs(ray.direction.y) < 0.0001) return false;
+    t = (FLOOR_Y - ray.origin.y) / ray.direction.y;
+    return t > 0.001;
+}
+
+HitData traceScene(Ray ray, bool includeLight) {
+    HitData hit;
+    hit.hit = false;
+    hit.t = 1e10;
+    float t;
+    vec3 n;
+    int nearestWall = -1;
+
+    if (includeLight && intersectSphere(ray, lightBulb, t) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t,
+                      normalize((ray.origin + ray.direction * t) - lightBulb.center),
+                      lightBulb.color, 0.0, true, false);
+    }
+    if (intersectBox(ray, lightCord, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      lightCord.color, lightCord.reflectivity, false, false);
+    }
+
+    if (intersectFloor(ray, t) && t < hit.t) {
+        vec3 p = ray.origin + ray.direction * t;
+        float wetness;
+        vec3 color = getFloorColor(p, wetness);
+
+        float wetReflectivity = 0.43 * wetness;
+        hit = HitData(true, t, p, vec3(0.0, 1.0, 0.0), color,
+                      wetReflectivity, false, false);
+    }
+
+    if (intersectBox(ray, backWall, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      backWall.color, backWall.reflectivity, false, false);
+        nearestWall = 0;
+    }
+    if (intersectBox(ray, frontWall, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      frontWall.color, frontWall.reflectivity, false, false);
+        nearestWall = 1;
+    }
+    if (intersectBox(ray, westWallNorth, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      westWallNorth.color, westWallNorth.reflectivity, false, false);
+        nearestWall = 2;
+    }
+    if (intersectBox(ray, westWallSouth, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      westWallSouth.color, westWallSouth.reflectivity, false, false);
+        nearestWall = 2;
+    }
+    if (intersectBox(ray, westWallHeader, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      westWallHeader.color, westWallHeader.reflectivity, false, false);
+        nearestWall = 2;
+    }
+    if (intersectRotatedYBox(ray, DOOR_CENTER, DOOR_HALF, DOOR_YAW, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      DOOR_COLOR, 0.0, false, false);
+        nearestWall = -1;
+    }
+    if (intersectRotatedYBox(ray, DOOR_HANDLE_CENTER, DOOR_HANDLE_HALF, DOOR_YAW, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      DOOR_HANDLE_COLOR, 0.0, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, ceiling, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      ceiling.color, ceiling.reflectivity, false, false);
+        nearestWall = -1;
+    }
+
+    if (intersectCountertop(ray, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      STONE_COLOR, 0.0, false, false);
+        nearestWall = -1;
+    }
+    if (intersectSinkBowl(ray, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      BASIN_COLOR, 0.0, false, false);
+        nearestWall = -1;
+    }
+    if (intersectSinkWater(ray, t) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t,
+                      vec3(0.0, 1.0, 0.0), SINK_WATER_COLOR,
+                      0.22, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, vanityLeft, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, vanityLeft.color, vanityLeft.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, vanityRight, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, vanityRight.color, vanityRight.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, vanityBack, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, vanityBack.color, vanityBack.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, vanityBottom, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, vanityBottom.color, vanityBottom.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, leftDoor, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, leftDoor.color, leftDoor.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, rightDoor, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, rightDoor.color, rightDoor.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, kickboard, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, kickboard.color, kickboard.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, leftHandle, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, leftHandle.color, leftHandle.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, rightHandle, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, rightHandle.color, rightHandle.reflectivity, false, false);
+        nearestWall = -1;
+    }
+
+    if (intersectBox(ray, faucetBase, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, faucetBase.color, faucetBase.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, faucetStem, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, faucetStem.color, faucetStem.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, faucetSpout, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, faucetSpout.color, faucetSpout.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, faucetTip, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, faucetTip.color, faucetTip.reflectivity, false, false);
+        nearestWall = -1;
+    }
+
+    if (intersectBox(ray, mirror, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, mirror.color, mirror.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, mirrorTop, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, mirrorTop.color, mirrorTop.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, mirrorBottom, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, mirrorBottom.color, mirrorBottom.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, mirrorLeft, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, mirrorLeft.color, mirrorLeft.reflectivity, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, mirrorRight, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, mirrorRight.color, mirrorRight.reflectivity, false, false);
+        nearestWall = -1;
+    }
+
+    if (intersectBox(ray, toiletTank, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      toiletTank.color, 0.0, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, toiletTankLid, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      toiletTankLid.color, 0.0, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, toiletFlushButton, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      toiletFlushButton.color, 0.0, false, false);
+        nearestWall = -1;
+    }
+    if (intersectBox(ray, toiletPedestal, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      toiletPedestal.color, 0.0, false, false);
+        nearestWall = -1;
+    }
+    if (intersectToiletBody(ray, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      TOILET_CERAMIC, 0.0, false, false);
+        nearestWall = -1;
+    }
+    if (intersectToiletSeat(ray, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      TOILET_SEAT_COLOR, 0.0, false, false);
+        nearestWall = -1;
+    }
+    if (intersectToiletInterior(ray, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n,
+                      TOILET_INSIDE_COLOR, 0.0, false, false);
+        nearestWall = -1;
+    }
+
+    // Material noise runs only on visible hits, not shadow rays
+    if (includeLight && hit.hit && nearestWall >= 0) {
+        hit.color = getWallColor(hit.point, nearestWall);
+    }
+
+    if (includeLight && hit.hit && !hit.isLight && nearestWall < 0) {
+        if (distance(hit.color, BASIN_COLOR) < 0.0001) {
+            hit.color = getPorcelainColor(hit.point, BASIN_COLOR, 0);
+        } else if (distance(hit.color, TOILET_CERAMIC) < 0.0001) {
+            hit.color = getPorcelainColor(hit.point, TOILET_CERAMIC, 1);
+        } else if (distance(hit.color, TOILET_SEAT_COLOR) < 0.0001) {
+            hit.color = getPorcelainColor(hit.point, TOILET_SEAT_COLOR, 2);
+        } else if (distance(hit.color, TOILET_INSIDE_COLOR) < 0.0001) {
+            hit.color = getPorcelainColor(hit.point, TOILET_INSIDE_COLOR, 3);
+        } else if (distance(hit.color, SINK_WATER_COLOR) < 0.0001) {
+            hit.color = getSinkWaterColor(hit.point);
+        } else if (distance(hit.color, WOOD_COLOR) < 0.0001) {
+            hit.color = getAgedWoodColor(hit.point, WOOD_COLOR, 0);
+        } else if (distance(hit.color, WOOD_DOOR_COLOR) < 0.0001) {
+            hit.color = getAgedWoodColor(hit.point, WOOD_DOOR_COLOR, 1);
+        } else if (distance(hit.color, vec3(0.14, 0.095, 0.065)) < 0.0001) {
+            hit.color = getAgedWoodColor(hit.point, vec3(0.14, 0.095, 0.065), 3);
+        } else if (distance(hit.color, DOOR_COLOR) < 0.0001) {
+            hit.color = getAgedWoodColor(hit.point, DOOR_COLOR, 2);
+        } else if (distance(hit.color, mirror.color) < 0.0001) {
+            float grime = getMirrorGrime(hit.point);
+            hit.color = getMirrorColor(hit.point, grime);
+            hit.reflectivity = mix(0.94, 0.63, grime);
+        } else if (distance(hit.color, ceiling.color) < 0.0001) {
+            hit.color = getCeilingColor(hit.point);
+        }
+    }
+    return hit;
+}
+
+// Lighting and reflection bounces
+vec3 trace(Ray ray) {
+    vec3 color = vec3(0.0);
+    vec3 attenuation = vec3(1.0);
+
+    for (int bounce = 0; bounce < u_maxBounces; bounce++) {
+        HitData hit = traceScene(ray, true);
+
+        if (!hit.hit) {
+
+            break;
+        }
+
+        if (hit.isLight) {
+
+            color += attenuation * lightBulb.color * (LIGHT_POWER * 0.85) * u_lightFlicker;
+            break;
+        }
+
+        vec3 toLight = lightBulb.center - hit.point;
+        float lightDist = length(toLight);
+        vec3 lightDir = toLight / lightDist;
+
+        HitData blocker = traceScene(Ray(hit.point + hit.normal * 0.001, lightDir), false);
+        float visible = blocker.hit && blocker.t < lightDist ? 0.0 : 1.0;
+        float diff = max(dot(hit.normal, lightDir), 0.0);
+        float falloff = 1.0 / (1.0 + 0.1 * lightDist * lightDist);
+
+        float lightStrength = LIGHT_POWER * u_lightFlicker;
+
+        vec3 shading = hit.color * (lightStrength * diff * falloff * visible + u_ambientStrength);
+
+        if (hit.normal.y > 0.99 && hit.reflectivity > 0.001) {
+            vec3 viewDir = normalize(-ray.direction);
+            vec3 reflectedLight = reflect(-lightDir, hit.normal);
+            float highlight = pow(max(dot(viewDir, reflectedLight), 0.0), 58.0);
+            float sheen = (hit.reflectivity / 0.43) * highlight;
+            shading += vec3(0.68, 0.73, 0.67) * (lightStrength * falloff * visible * 0.55 * sheen);
+        }
+        color += attenuation * shading * (1.0 - hit.reflectivity);
+
+        if (hit.reflectivity == 0.0) break;
+        attenuation *= hit.reflectivity;
+        ray = Ray(hit.point + hit.normal * 0.001, reflect(ray.direction, hit.normal));
+    }
+
+    return color;
+}
+
+void main() {
+
+    float cp = cos(u_cameraOrbit.x), sp = sin(u_cameraOrbit.x);
+    float cy = cos(u_cameraOrbit.y), sy = sin(u_cameraOrbit.y);
+    mat3 rotX = mat3(1.0, 0.0, 0.0,  0.0, cp, -sp,  0.0, sp, cp);
+    mat3 rotY = mat3(cy, 0.0, -sy,  0.0, 1.0, 0.0,  sy, 0.0, cy);
+    mat3 camera = rotY * rotX;
+
+    vec3 target = vec3(0.0, 1.45, -6.0);
+    vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+    Ray ray = Ray(target + camera * vec3(0.0, 0.0, u_cameraDistance),
+                  camera * normalize(vec3(uv, -1.5)));
+
+    fragColor = vec4(pow(trace(ray), vec3(1.0 / 2.2)), 1.0);
+}
+</script>
+
+<script>
+  const canvas = document.getElementById('glcanvas');
+  const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+  const vertEditor = document.getElementById('vertEditor');
+  const fragEditor = document.getElementById('fragEditor');
+  const shaderError = document.getElementById('shaderError');
+  const bounces = document.getElementById('bounces');
+  const ambient = document.getElementById('ambient');
+  const cameraDistance = document.getElementById('cameraDistance');
+  const flicker = document.getElementById('flicker');
+
+  vertEditor.value = document.getElementById('vertex-shader').textContent;
+  fragEditor.value = document.getElementById('fragment-shader').textContent;
+  let program = null;
+  let locations = null;
+  let drawRequested = false;
+  let flickerAnimating = false;
+  let lastFlickerFrame = -Infinity;
+  let nextFlickerChange = 0;
+  let bulbPower = 0;
+  let pitch = 0.08, yaw = 1.57;
+
+  if (!gl) {
+    shaderError.textContent = 'WebGL 2 unavailable. Try a different browser or enable hardware acceleration.';
+  } else {
+    gl.bindVertexArray(gl.createVertexArray());
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER,
+      new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(0);
+  }
+
+  function compile(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(shader);
+      gl.deleteShader(shader);
+      throw new Error(log);
+    }
+    return shader;
+  }
+
+  function createProgram(vsSource, fsSource) {
+    const vs = compile(gl.VERTEX_SHADER, vsSource);
+    const fs = compile(gl.FRAGMENT_SHADER, fsSource);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.bindAttribLocation(prog, 0, 'position');
+    gl.linkProgram(prog);
+    gl.detachShader(prog, vs);
+    gl.detachShader(prog, fs);
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      const log = gl.getProgramInfoLog(prog);
+      gl.deleteProgram(prog);
+      throw new Error(log);
+    }
+    return prog;
+  }
+
+  function requestDraw() {
+    if (!gl || !program || drawRequested) return;
+    drawRequested = true;
+    requestAnimationFrame(draw);
+  }
+
+  // Random outages and short bursts of light
+  function flickerValueAt(timeMs) {
+    if (timeMs < nextFlickerChange) return bulbPower;
+
+    if (bulbPower <= 0.001) {
+
+      bulbPower = Math.random() < 0.75
+        ? 0.25 + Math.random() * 0.25
+        : 0.55 + Math.random() * 0.2;
+      nextFlickerChange = timeMs + 130 + Math.random() * 450;
+    } else if (Math.random() < 0.82) {
+
+      bulbPower = 0;
+      nextFlickerChange = timeMs + 270 + Math.random() * 850;
+    } else {
+
+      bulbPower = 0.07 + Math.random() * 0.15;
+      nextFlickerChange = timeMs + 100 + Math.random() * 170;
+    }
+    return bulbPower;
+  }
+
+  function draw(now = 0) {
+    drawRequested = false;
+    if (!gl || !program || document.hidden) return;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(program);
+    gl.uniform1f(locations.time, now * 0.001);
+    gl.uniform2f(locations.resolution, canvas.width, canvas.height);
+    gl.uniform1i(locations.bounces, Number(bounces.value));
+    gl.uniform1f(locations.ambient, Number(ambient.value));
+    gl.uniform2f(locations.orbit, pitch, yaw);
+    gl.uniform1f(locations.distance, Number(cameraDistance.value));
+    gl.uniform1f(locations.lightFlicker, flicker.checked ? flickerValueAt(now) : 0.0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  }
+
+  function animateFlicker(now) {
+    if (!flicker.checked || document.hidden) {
+      flickerAnimating = false;
+      return;
+    }
+    if (now - lastFlickerFrame >= 100) {
+      lastFlickerFrame = now;
+      requestDraw();
+    }
+    requestAnimationFrame(animateFlicker);
+  }
+
+  function startFlicker() {
+    if (flickerAnimating || !flicker.checked || document.hidden) return;
+    flickerAnimating = true;
+    lastFlickerFrame = -Infinity;
+    requestAnimationFrame(animateFlicker);
+  }
+
+  function updateProgram() {
+    if (!gl) return;
+    try {
+      const next = createProgram(vertEditor.value, fragEditor.value);
+      if (program) gl.deleteProgram(program);
+      program = next;
+      locations = {
+        time: gl.getUniformLocation(program, 'u_time'),
+        resolution: gl.getUniformLocation(program, 'u_resolution'),
+        bounces: gl.getUniformLocation(program, 'u_maxBounces'),
+        ambient: gl.getUniformLocation(program, 'u_ambientStrength'),
+        orbit: gl.getUniformLocation(program, 'u_cameraOrbit'),
+        distance: gl.getUniformLocation(program, 'u_cameraDistance'),
+        lightFlicker: gl.getUniformLocation(program, 'u_lightFlicker')
+      };
+      shaderError.textContent = '';
+      requestDraw();
+    } catch (e) {
+      shaderError.textContent = e.message.replace(/\0/g, '');
+    }
+  }
+
+  let compileTimer;
+  // Recompile after the user stops typing
+  function scheduleCompile() {
+    clearTimeout(compileTimer);
+    compileTimer = setTimeout(updateProgram, 650);
+  }
+  vertEditor.addEventListener('input', scheduleCompile);
+  fragEditor.addEventListener('input', scheduleCompile);
+  updateProgram();
+
+  for (const slider of [bounces, ambient, cameraDistance]) {
+    slider.addEventListener('input', () => {
+      document.getElementById(slider.id + 'Value').textContent = slider.value;
+      requestDraw();
+    });
+  }
+
+  canvas.addEventListener('pointerdown', e => canvas.setPointerCapture(e.pointerId));
+  canvas.addEventListener('pointermove', e => {
+    if (!canvas.hasPointerCapture(e.pointerId)) return;
+    yaw -= e.movementX * 0.01;
+    pitch = Math.min(0.75, Math.max(-0.35, pitch + e.movementY * 0.01));
+    requestDraw();
+  });
+  flicker.addEventListener('change', () => {
+    if (flicker.checked) {
+      nextFlickerChange = 0;
+      bulbPower = 0;
+    }
+    requestDraw();
+    startFlicker();
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      requestDraw();
+      startFlicker();
+    }
+  });
+
+  startFlicker();
+</script>
+</body>
+
+</html>
